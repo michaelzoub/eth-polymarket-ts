@@ -80,8 +80,9 @@ class SignalDetector {
       const oldestPrice = this.priceHistory[0].price;
       const newestPrice = this.priceHistory[this.priceHistory.length - 1].price;
 
-      const direction: "UP" | "DOWN" =
-        newestPrice >= oldestPrice ? "UP" : "DOWN";
+      const direction: "UP" | "DOWN" = newestPrice >= oldestPrice ? "UP" : "DOWN";
+
+      console.log("Price history array: ", this.priceHistory);
 
       console.log(`🔄 Detected signal: ${percentChange.toFixed(2)}%`);
 
@@ -272,6 +273,7 @@ async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
     const orderType = OrderType.FAK; //Fill and kill over Fill or kill
 
     try {
+      await TradingBot.updateMarketToken();
       const marketOrder = await this.client!.createMarketOrder({
         side: side === "BUY" ? Side.BUY : Side.SELL,
         tokenID: this.tokenId,
@@ -409,7 +411,7 @@ class TradingBot {
     }
   }
 
-  private async updateMarketToken(): Promise<void> {
+  async updateMarketToken(): Promise<void> {
     const afterNoon = Time.isPastNoon();
     const slug = Time.getNextMarketSlug(afterNoon);
 
@@ -554,7 +556,10 @@ class TradingBot {
           orderId: orderResp.orderID,
         };
 
-        setTimeout(() => this.exitPosition(), this.config.exitAfterSeconds * 1000,);
+        //TODO check every 1 second if in profit
+        setTimeout(() => {
+          this.exitPosition();
+        }, 5000);
       } else {
         console.error(`Failed to create position`);
         this.isProcessingSignal = false;
@@ -602,7 +607,7 @@ class TradingBot {
       } else {
         setTimeout(() => {
           this.exitPosition();
-        }, this.config.exitAfterSeconds * 1000);
+        }, 5000); //5 seconds
       }
     } catch (error) {
       console.error(`❌ Error exiting position:`, error);
