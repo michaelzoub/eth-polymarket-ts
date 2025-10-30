@@ -42,7 +42,7 @@ const loadConfig = (): Config => ({
   coinbasePassphrase: process.env.COINBASE_PASSPHRASE || "",
   polymarketPrivateKey: process.env.POLYMARKET_PRIVATE_KEY || "",
   polymarketFunder: process.env.POLYMARKET_FUNDER || "",
-  signalThresholdPercent: 0.5,
+  signalThresholdPercent: 0.2,
   signalWindowSeconds: 15,
   orderSize: 5.01,
   exitAfterSeconds: 25,
@@ -117,9 +117,10 @@ class CoinbaseWebSocket {
     this.ws.on("open", () => {
       console.log("✅ Connected to Coinbase Advanced Trade WebSocket");
 
+      //TODO: alternate between eth/btc depending on volume
       const subscribe = {
         type: "subscribe",
-        product_ids: ["ETH-USD"],
+        product_ids: ["BTC-USD"],
         channel: "ticker",
       };
 
@@ -168,12 +169,14 @@ class PolymarketClient {
   private client: ClobClient | null = null;
   tokenId: string;
   private initialized: boolean = false;
+  private bot: TradingBot | undefined;
 
   constructor(
     privateKey: string,
     funder: string,
     signatureType: number,
     tokenId: string,
+    bot?: TradingBot
   ) {
     const host = "https://clob.polymarket.com";
     //TODO: REMOVE BEFORE COMMITTING
@@ -184,6 +187,7 @@ class PolymarketClient {
 
     this.tokenId = tokenId;
     this.initClient(host, signer, signatureType, funderPass);
+    this.bot = bot;
   }
 
   private async initClient(
@@ -270,10 +274,10 @@ async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
     const marketPrice = await this.getMarketPrice(side);
     console.log(`📊 Current market price: $${marketPrice.toFixed(2)}`);
 
-    const orderType = OrderType.FAK; //Fill and kill over Fill or kill
+    const orderType = OrderType.FOK; //Fill and kill over Fill or kill
 
     try {
-      await TradingBot.updateMarketToken();
+      await this.bot?.updateMarketToken();
       const marketOrder = await this.client!.createMarketOrder({
         side: side === "BUY" ? Side.BUY : Side.SELL,
         tokenID: this.tokenId,
@@ -356,6 +360,7 @@ class TradingBot {
       this.config.polymarketFunder,
       this.config.signatureType,
       this.currentTokenId,
+      this
     );
 
     await this.polymarketClient.waitForInitialization();
@@ -422,12 +427,14 @@ class TradingBot {
     try {
       const tokens = await Market.fetchMarketTokens(slug);
       const ethPrice = await Market.getCurrentETHPrice();
+      const btcPrice = await Market.getCurrentBTCPrice();
 
       console.log(`💰 Current ETH Price: $${ethPrice.toFixed(2)}`);
       console.log(`📊 Available thresholds: ${Object.keys(tokens).join(", ")}`);
 
       const availableThresholds = Object.keys(tokens);
-      const targetRange = Market.getClosestPriceRange(ethPrice, availableThresholds);
+      //TODO: make changes atomic
+      const targetRange = Market.getClosestPriceRange(btcPrice, availableThresholds, "BTC");
 
       if (targetRange && tokens[targetRange]) {
         const newTokenId = tokens[targetRange];
@@ -446,11 +453,11 @@ class TradingBot {
           console.warn(
             `⚠️  Orderbook verification failed for $${targetRange} threshold`,
           );
-          await this.findAlternativeToken(tokens, ethPrice, [targetRange]);
+          await this.findAlternativeToken(tokens, btcPrice, [targetRange]);
         }
       } else {
         console.warn(`⚠️  Could not find suitable threshold`);
-        await this.findAlternativeToken(tokens, ethPrice, []);
+        await this.findAlternativeToken(tokens, btcPrice, []);
       }
     } catch (error) {
       console.error(`❌ Error updating market token:`, error);
@@ -460,14 +467,14 @@ class TradingBot {
     console.log(`========================================\n`);
   }
 
-  private async findAlternativeToken(tokens: MarketTokens, ethPrice: number, excludeThresholds: string[],): Promise<void> {
+  private async findAlternativeToken(tokens: MarketTokens, price: number, excludeThresholds: string[],): Promise<void> {
     console.log(`🔍 Searching for alternative token...`);
 
     const sortedThresholds = Object.keys(tokens)
       .filter((t) => !excludeThresholds.includes(t))
       .map((t) => ({
         threshold: t,
-        distance: Math.abs(parseInt(t) - ethPrice),
+        distance: Math.abs(parseInt(t) - price),
       }))
       .sort((a, b) => a.distance - b.distance);
 
@@ -477,8 +484,7 @@ class TradingBot {
 
       if (orderbookExists) {
         //TODO: USE tokenId
-        this.currentTokenId =
-          "32803028585408577868406458580018477946412590313011129483341370530019960345035"; //tokenId;
+        this.currentTokenId = "32803028585408577868406458580018477946412590313011129483341370530019960345035"; //tokenId;
         console.log(`✅ Alternative found: $${threshold} threshold`);
         console.log(`   Token ID: ${this.currentTokenId.slice(0, 20)}...`);
 
@@ -501,6 +507,7 @@ class TradingBot {
 
     this.marketUpdateInterval = setInterval(
       async () => {
+        //TODO add if else clause (if order open dont sell)
         console.log(`\n🔄 Periodic market check...`);
         await this.updateMarketToken();
       },
@@ -556,7 +563,7 @@ class TradingBot {
           orderId: orderResp.orderID,
         };
 
-        //TODO check every 1 second if in profit
+        //TODO check every 5 seconds if in profit
         setTimeout(() => {
           this.exitPosition();
         }, 5000);
@@ -594,6 +601,8 @@ class TradingBot {
       const { profit, profitPercent } = Market.calculateProfit(this.PolymarketBuyAsk!, this.PolymarketSellBid!, this.config.orderSize);
 
       let exitResponse;
+
+      console.log("💰 Profit: ", profit);
 
       if (profit > 0) {
         exitResponse = await this.polymarketClient.placeMarketOrder(exitSide, this.currentPosition.size,);

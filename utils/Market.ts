@@ -61,18 +61,30 @@ export default new class Market {
     );
     return parseFloat(response.data.data.amount);
   };
-    
-  getClosestPriceRange(currentPrice: number, availableThresholds: string[]): string | null {
-    const lowerBound = Math.floor(currentPrice / 100) * 100;
-    const upperBound = lowerBound + 100;
 
-    const tolerance = currentPrice * (0.5 / 100); //0.5% x ETH price
-  
+  async getCurrentBTCPrice(): Promise<number> {
+    const response = await axios.get(
+      "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+    );
+    return parseFloat(response.data.data.amount);
+  };
+    
+  //TODO: maybe use upper bound with upperbound - ethprice <= 50 
+  getClosestPriceRange(currentPrice: number, availableThresholds: string[], asset: string): string | null {
+    //TODO: look at bucket size
+    const bucketSize = asset === 'BTC' ? 2000 : 100;
+
+    const lowerBound = Math.floor(currentPrice / bucketSize) * bucketSize;
+    const upperBound = lowerBound + bucketSize;
+
+    const tolerancePercent = asset === 'BTC' ? 0.25 : 0.5;
+    const tolerance = currentPrice * (tolerancePercent / 100);
+
     const distanceToLower = currentPrice - lowerBound;
     const distanceToUpper = upperBound - currentPrice;
 
     let candidates: string[] = [];
-  
+
     if (distanceToLower <= tolerance) {
       candidates.push((lowerBound - 100).toString());
     }

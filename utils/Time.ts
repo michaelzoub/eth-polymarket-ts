@@ -1,6 +1,9 @@
 
 
 export default new class Time {
+
+    private markets = ["ethereum-price-on", "bitcoin-above-on"];
+
     getCurrentETTime(): Date {
     return new Date(
         new Date().toLocaleString("en-US", { timeZone: "America/New_York" }),
@@ -21,6 +24,6 @@ export default new class Time {
     const month = target.toLocaleString("en-US", { month: "long" }).toLowerCase();
     const day = target.getDate();
 
-    return `ethereum-price-on-${month}-${day}`;
+    return `${this.markets[1]}-${month}-${day}`;
     };
 }
