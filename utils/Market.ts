@@ -77,7 +77,7 @@ export default new class Market {
     const lowerBound = Math.floor(currentPrice / bucketSize) * bucketSize;
     const upperBound = lowerBound + bucketSize;
 
-    const tolerancePercent = asset === 'BTC' ? 0.25 : 0.5;
+    const tolerancePercent = asset === 'BTC' ? 0.5 : 0.5;
     const tolerance = currentPrice * (tolerancePercent / 100);
 
     const distanceToLower = currentPrice - lowerBound;

@@ -245,14 +245,18 @@ class PolymarketClient {
       const response = await axios.get(
         `https://clob.polymarket.com/book?token_id=${this.tokenId}`,
       );
-      console.log(response);
+
+      //TODO: choose yes/no tokens instead
+      //console.log(response);
       if (side === "BUY") {
         const bestAsk = response.data.asks?.[0]?.price;
+        console.log("BEST ASK: ", bestAsk, parseFloat(bestAsk));
         return bestAsk ? parseFloat(bestAsk) : 0.5;
       } else {
         const bestBid = response.data.bids?.[0]?.price;
         return bestBid ? parseFloat(bestBid) : 0.5;
       }
+      
     } catch (error) {
       console.error("Error fetching market price:", error);
       return 0.5; 
@@ -284,7 +288,7 @@ async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
         amount: amount, 
         feeRateBps: 0,
         nonce: 0,
-        price: 0.5, 
+        price: marketPrice, 
       });
 
       console.log("✅ Created market order:", marketOrder);
