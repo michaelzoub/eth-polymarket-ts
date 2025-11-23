@@ -1,3 +1,6 @@
 export interface MarketTokens {
-  [threshold: string]: string;
+  [threshold: string]: {
+    yes: string;
+    no: string;
+  };
 }

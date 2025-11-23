@@ -5,41 +5,45 @@ import axios from "axios";
 export default new class Market {
   async fetchMarketTokens(slug: string): Promise<MarketTokens> {
     const url = `https://gamma-api.polymarket.com/events/slug/${slug}`;
-  
+
     try {
       const response = await axios.get(url);
-  
+
       if (!response.data || !response.data.markets) {
         throw new Error(`Invalid response from Gamma API for slug: ${slug}`);
       }
-  
+
       const tokens: MarketTokens = {};
-  
+
       for (const market of response.data.markets as PolymarketMarket[]) {
         // Skip inactive or closed markets
         if (!market.active || market.closed) {
           console.log(`⚠️  Skipping inactive market: ${market.question}`);
           continue;
         }
-  
+
         try {
           const tokenIds = JSON.parse(market.clobTokenIds);
           const parts = market.question.split("$");
-  
+
           if (parts.length >= 2) {
             const threshold = parts[1].split(" ")[0].replace(/,/g, "");
-            tokens[threshold] = tokenIds[0]; // YES token
-            console.log(`   Found threshold $${threshold}: ${tokenIds[0]}`);
+            // Store both YES and NO tokens
+            tokens[threshold] = {
+              yes: tokenIds[0],
+              no: tokenIds[1]
+            };
+            console.log(`   Found threshold $${threshold}: YES=${tokenIds[0]}, NO=${tokenIds[1]}`);
           }
         } catch (parseError) {
           console.error(`⚠️  Error parsing market data:`, parseError);
         }
       }
-  
+
       if (Object.keys(tokens).length === 0) {
         throw new Error(`No active markets found for slug: ${slug}`);
       }
-  
+
       return tokens;
     } catch (error) {
       if (axios.isAxiosError(error)) {
@@ -131,45 +135,45 @@ export default new class Market {
     }
   };
 
-  async getPolymarketBuyAsk(tokenId: string): Promise<number | null> {
-      try {
-      const response = await axios.get(
-          `https://clob.polymarket.com/book?token_id=${tokenId}`,
-      );
+async getPolymarketSellBid(tokenId: string): Promise<number | null> {
+  try {
+    const response = await axios.get(
+      `https://clob.polymarket.com/book?token_id=${tokenId}`,
+    );
 
-      if (response.data?.asks && response.data.asks.length > 0) {
-          const bestAsk = parseFloat(response.data.asks[0].price);
-          console.log(`💰 Best ask (buy price): $${bestAsk.toFixed(2)}`);
-          return bestAsk;
-      }
-
-      console.warn(`⚠️  No asks available for token ${tokenId.slice(0, 20)}...`);
-      return null;
-      } catch (error) {
-      console.error(`❌ Failed to fetch ask price for token ${tokenId.slice(0, 20)}...`);
-      return null;
-      }
-  }
-
-  async getPolymarketSellBid(tokenId: string): Promise<number | null> {
-    try {
-      const response = await axios.get(
-        `https://clob.polymarket.com/book?token_id=${tokenId}`,
-      );
-
-      if (response.data?.bids && response.data.bids.length > 0) {
-        const bestBid = parseFloat(response.data.bids[0].price);
-        console.log(`💰 Best bid (sell price): $${bestBid.toFixed(2)}`);
-        return bestBid;
-      }
-
-      console.warn(`⚠️  No bids available for token ${tokenId.slice(0, 20)}...`);
-      return null;
-    } catch (error) {
-      console.error(`❌ Failed to fetch bid price for token ${tokenId.slice(0, 20)}...`);
-      return null;
+    if (response.data?.bids && response.data.bids.length > 0) {
+      const bestBid = parseFloat(response.data.bids[response.data.bids.length - 1].price);
+      console.log(`💰 Best bid (sell price): $${bestBid.toFixed(2)}`);
+      return bestBid;
     }
+
+    console.warn(`⚠️  No bids available for token ${tokenId.slice(0, 20)}...`);
+    return null;
+  } catch (error) {
+    console.error(`❌ Failed to fetch bid price for token ${tokenId.slice(0, 20)}...`);
+    return null;
   }
+}
+
+async getPolymarketBuyAsk(tokenId: string): Promise<number | null> {
+  try {
+    const response = await axios.get(
+      `https://clob.polymarket.com/book?token_id=${tokenId}`,
+    );
+
+    if (response.data?.asks && response.data.asks.length > 0) {
+      const bestAsk = parseFloat(response.data.asks[response.data.asks.length - 1].price);
+      console.log(`💰 Best ask (buy price): $${bestAsk.toFixed(2)}`);
+      return bestAsk;
+    }
+
+    console.warn(`⚠️  No asks available for token ${tokenId.slice(0, 20)}...`);
+    return null;
+  } catch (error) {
+    console.error(`❌ Failed to fetch ask price for token ${tokenId.slice(0, 20)}...`);
+    return null;
+  }
+}
 
   /**
    * Calculate profit/loss for a round-trip trade
@@ -186,4 +190,8 @@ export default new class Market {
 
     return { profit, profitPercent };
   }
+
+  //TODO: could also use this to check spreads: https://docs.polymarket.com/api-reference/spreads/get-bid-ask-spreads
+
+
 }

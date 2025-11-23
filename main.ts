@@ -17,11 +17,15 @@ import { MarketTokens } from "./types/MarketTokens";
 
 import Market from "./utils/Market";
 import Time from "./utils/Time";
-//deleting old code from git!
+//TODO: make sure fills are GOOD and collect data for analysis.
+
+interface OrderbookEntry {
+  price: number;
+  size: number;
+}
 
 //looks like index price
 const coinbase_ws_url = "wss://advanced-trade-ws.coinbase.com";
-
 
 interface Config {
   coinbaseApiKey: string;
@@ -34,6 +38,7 @@ interface Config {
   orderSize: number;
   exitAfterSeconds: number;
   signatureType: number;
+  tokenPriceRiskThreshold: number
 }
 
 const loadConfig = (): Config => ({
@@ -42,11 +47,12 @@ const loadConfig = (): Config => ({
   coinbasePassphrase: process.env.COINBASE_PASSPHRASE || "",
   polymarketPrivateKey: process.env.POLYMARKET_PRIVATE_KEY || "",
   polymarketFunder: process.env.POLYMARKET_FUNDER || "",
-  signalThresholdPercent: 0.2,
+  signalThresholdPercent: 0.10,
   signalWindowSeconds: 15,
-  orderSize: 5.01,
+  orderSize: 5.0001,
   exitAfterSeconds: 25,
   signatureType: 1, //0: EOA, 1: Magic/Proxy Wallet, 2: Gnosis Safe (MetaMask, etc.)
+  tokenPriceRiskThreshold: 0.2
 });
 
 
@@ -54,6 +60,8 @@ class SignalDetector {
   private thresholdPercent: number;
   private windowSeconds: number;
   private priceHistory: PriceUpdate[] = [];
+  private percentChanged: number | undefined;
+  direction: string | undefined;
 
   constructor(thresholdPercent: number, windowSeconds: number) {
     this.thresholdPercent = thresholdPercent;
@@ -75,12 +83,14 @@ class SignalDetector {
     const lowestPrice = Math.min(...prices);
 
     const percentChange = ((highestPrice - lowestPrice) / lowestPrice) * 100;
+    this.percentChanged = percentChange;
 
     if (percentChange > this.thresholdPercent) {
       const oldestPrice = this.priceHistory[0].price;
       const newestPrice = this.priceHistory[this.priceHistory.length - 1].price;
 
       const direction: "UP" | "DOWN" = newestPrice >= oldestPrice ? "UP" : "DOWN";
+      this.direction = direction;
 
       console.log("Price history array: ", this.priceHistory);
 
@@ -96,6 +106,10 @@ class SignalDetector {
     }
 
     return null;
+  }
+
+  getPercentChange() {
+    return this.percentChanged;
   }
 }
 
@@ -166,20 +180,16 @@ class CoinbaseWebSocket {
 
 
 class PolymarketClient {
-  private client: ClobClient | null = null;
+  client: ClobClient | null = null;
   tokenId: string;
   private initialized: boolean = false;
   private bot: TradingBot | undefined;
+  tokenId_openOrder: string = "";
+  private signalDetector: SignalDetector | undefined;
+  takingAmount: string = "";
 
-  constructor(
-    privateKey: string,
-    funder: string,
-    signatureType: number,
-    tokenId: string,
-    bot?: TradingBot
-  ) {
+  constructor(privateKey: string, funder: string, signatureType: number, tokenId: string, bot?: TradingBot, signal?: SignalDetector) {
     const host = "https://clob.polymarket.com";
-    //TODO: REMOVE BEFORE COMMITTING
     const funderPass = "0x86d3cC7E26aBdB0AF1e1E4Eba6D075c3cA0721Ae"; 
     const signer = new Wallet(
       privateKey,
@@ -190,12 +200,7 @@ class PolymarketClient {
     this.bot = bot;
   }
 
-  private async initClient(
-    host: string,
-    signer: Wallet,
-    signatureType: number,
-    funder: string,
-  ): Promise<void> {
+  private async initClient(host: string, signer: Wallet, signatureType: number, funder: string): Promise<void> {
     try {
       const tempClient = new ClobClient(
         host,
@@ -226,6 +231,65 @@ class PolymarketClient {
     }
   }
 
+  //TODO: test out
+  async sellAllShares(
+    client: ClobClient,
+    tokenId: string,
+    totalAmount: number,
+    minAcceptablePrice: number = 0
+  ): Promise<void> {
+    try {
+      // 1️⃣ Fetch full order book
+      const orderbookResp = await axios.get(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+      const bids: OrderbookEntry[] = (orderbookResp.data.bids || [])
+        .map((b: any) => ({ price: parseFloat(b.price), size: parseFloat(b.size) }))
+        .sort((a, b) => b.price - a.price); // highest first
+
+      if (!bids.length) {
+        console.warn("⚠️ No bids available, cannot sell.");
+        return;
+      }
+
+      let remaining = totalAmount;
+
+      // 2️⃣ Walk through bids
+      for (const bid of bids) {
+        if (remaining <= 0) break;
+
+        // Skip if price below minimum
+        if (bid.price < minAcceptablePrice) {
+          console.warn(`⚠️ Bid price $${bid.price} below min acceptable $${minAcceptablePrice}, stopping sell.`);
+          break;
+        }
+
+        const sellAmount = Math.min(remaining, bid.size);
+
+        // 3️⃣ Create a FAK market order for this chunk
+        const order = await client.createMarketOrder({
+          side: Side.SELL,
+          tokenID: tokenId,
+          amount: sellAmount,
+          price: bid.price,
+          feeRateBps: 0,
+          nonce: 0,
+        });
+
+        const response = await client.postOrder(order, OrderType.FAK);
+        console.log(`✅ Sold ${sellAmount} shares at $${bid.price} — response:`, response);
+
+        remaining -= sellAmount;
+      }
+
+      if (remaining > 0) {
+        console.warn(`⚠️ Could not sell ${remaining} shares — insufficient liquidity at current bids.`);
+      } else {
+        console.log("✅ All shares sold successfully.");
+      }
+    } catch (error) {
+      console.error("❌ Failed to sell all shares:", error);
+    }
+  }
+
   async waitForInitialization(): Promise<void> {
     while (!this.initialized) {
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -234,36 +298,14 @@ class PolymarketClient {
 
   updateTokenId(tokenId: string): void {
     this.tokenId = tokenId;
+    this.bot?.setCurrentTokenId(tokenId);
   }
 
   getTokenId(): string {
     return this.tokenId;
   }
 
-  async getMarketPrice(side: "BUY" | "SELL"): Promise<number> {
-    try {
-      const response = await axios.get(
-        `https://clob.polymarket.com/book?token_id=${this.tokenId}`,
-      );
-
-      //TODO: choose yes/no tokens instead
-      //console.log(response);
-      if (side === "BUY") {
-        const bestAsk = response.data.asks?.[0]?.price;
-        console.log("BEST ASK: ", bestAsk, parseFloat(bestAsk));
-        return bestAsk ? parseFloat(bestAsk) : 0.5;
-      } else {
-        const bestBid = response.data.bids?.[0]?.price;
-        return bestBid ? parseFloat(bestBid) : 0.5;
-      }
-      
-    } catch (error) {
-      console.error("Error fetching market price:", error);
-      return 0.5; 
-    }
-  }
-
-async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
+  async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
     await this.waitForInitialization();
 
     console.log(
@@ -275,27 +317,85 @@ async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
       throw new Error(`Orderbook does not exist for token ${this.tokenId}`);
     }
 
-    const marketPrice = await this.getMarketPrice(side);
-    console.log(`📊 Current market price: $${marketPrice.toFixed(2)}`);
+    let marketPrice = side === "BUY" ? await Market.getPolymarketBuyAsk(this.tokenId) : await Market.getPolymarketSellBid(this.tokenId);
 
-    const orderType = OrderType.FOK; //Fill and kill over Fill or kill
+    if (!marketPrice) {
+      throw new Error(`Could not fetch market price for ${side}`);
+    }
+
+    console.log(`📊 Current market price: $${marketPrice.toFixed(4)}`);
+
+    let orderType = OrderType.FAK; //Fill and kill over Fill or kill
 
     try {
-      await this.bot?.updateMarketToken();
-      const marketOrder = await this.client!.createMarketOrder({
-        side: side === "BUY" ? Side.BUY : Side.SELL,
-        tokenID: this.tokenId,
-        amount: amount, 
-        feeRateBps: 0,
-        nonce: 0,
-        price: marketPrice, 
-      });
+      let marketOrder;
+      //TODO: find out how to fully sell
+      //const fills = await this.client!.getFills(orderResp.orderID);
+      //const filledAmount = fills.reduce((sum, f) => sum + parseFloat(f.size), 0);
+      if (side === "SELL") {
+        if (this.bot?.getCurrentPosition() !== null) {
+          orderType = OrderType.FAK; 
+        }
+        marketOrder = await this.client!.createMarketOrder({
+          side: Side.SELL,
+          tokenID: this.tokenId,
+          amount: amount, 
+          feeRateBps: 0,
+          nonce: 0,
+          price: marketPrice, 
+        });
+
+       // await this.sellAllShares(this.client!, this.tokenId, amount);
+      } else {
+        if (this.bot?.getCurrentPosition() !== null) {
+          return;
+        }
+
+        //check for spread:
+        const polymarketSellBid = await Market.getPolymarketSellBid(this.tokenId);
+        const { profitPercent } = await Market.calculateProfit(marketPrice, polymarketSellBid!, amount);
+        if (profitPercent < -15 && (polymarketSellBid! > this.bot.config.tokenPriceRiskThreshold && marketPrice > this.bot.config.tokenPriceRiskThreshold)) {
+          return;
+        } else if (profitPercent < -20 && side === "BUY") {
+          return;
+        }
+
+        if (marketPrice > 0.6 && side === "BUY") {
+          //this.PolymarketBuyAsk, this.PolymarketSellBid
+          if (this.signalDetector?.direction == "UP") {
+            await this.bot.updateMarketToken(true, "UP");
+          } else {
+            await this.bot.updateMarketToken(true, "DOWN");
+          }
+          this.bot.PolymarketBuyAsk = await Market.getPolymarketBuyAsk(this.tokenId);
+          this.bot.PolymarketSellBid = await Market.getPolymarketSellBid(this.tokenId);
+          console.log(`⚠️  Price too high: $${marketPrice.toFixed(4)} > $0.60, skipping buy`);
+          //return { success: false, error: "Price above threshold" };
+          marketPrice = side === "BUY" ? await Market.getPolymarketBuyAsk(this.tokenId) : await Market.getPolymarketSellBid(this.tokenId);
+        } else {
+          await this.bot?.updateMarketToken();
+        }
+        marketOrder = await this.client!.createMarketOrder({
+          side: Side.BUY,
+          tokenID: this.tokenId,
+          amount: amount, 
+          feeRateBps: 0,
+          nonce: 0,
+          price: marketPrice!, 
+        });
+      }
 
       console.log("✅ Created market order:", marketOrder);
 
       const response = await this.client!.postOrder(marketOrder, orderType);
 
       console.log(`✅ Order response:`, response);
+
+      //if (side === "SELL")
+
+      if (side === "BUY") {
+        this.takingAmount = response.takingAmount;
+      }
 
       if (response.error || response.status === 400 || response.success === false) {
         const errorMsg = response.error || response.errorMsg || 'Unknown error';
@@ -307,17 +407,27 @@ async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
         
         throw new Error(`Order failed: ${errorMsg}`);
       }
-
       return response;
     } catch (error: any) {
       console.error(`❌ Error placing order:`, error.message);
 
-      if (error.message?.toLowerCase().includes("invalid signature")) {
-        console.log(
-          "💡 Tip: Try changing negRisk to true if this is a NegRisk market",
-        );
+      const errorMsg = error?.message?.toLowerCase() || "";
+
+      // 🔁 If FOK failed due to partial fill or balance desync, try again
+      if (side === "SELL" && (
+        errorMsg.includes("not enough balance") ||
+        errorMsg.includes("allowance") ||
+        errorMsg.includes("failed") ||
+        errorMsg.includes("insufficient")
+      )) {
+        console.warn("⚠️ Detected partial fill or balance desync — entering retry loop...");
       }
 
+      if (error.message?.toLowerCase().includes("invalid signature")) {
+        console.log("💡 Tip: Try changing negRisk to true if this is a NegRisk market");
+      }
+
+      // Re-throw to let exitPosition handle higher-level cleanup if needed
       throw error;
     }
   }
@@ -325,11 +435,13 @@ async placeMarketOrder(side: "BUY" | "SELL", amount: number): Promise<any> {
 
 
 class TradingBot {
-  private config: Config;
+  config: Config;
   private polymarketClient: PolymarketClient | null = null;
   private signalDetector: SignalDetector;
   private coinbaseWs: CoinbaseWebSocket;
   private currentPosition: Position | null = null;
+  private currentYesTokenId: string = "";
+  private currentNoTokenId: string = "";
   private currentTokenId: string = "";
   private marketUpdateInterval: NodeJS.Timeout | null = null;
   private isProcessingSignal = false;
@@ -346,31 +458,54 @@ class TradingBot {
     this.coinbaseWs = new CoinbaseWebSocket();
   }
 
+//   private async getTokenBalance(tokenId: string): Promise<number> {
+//   try {
+//     // Get balance from Polymarket CLOB API
+//     const balances = await this.polymarketClient?.client?.getBalances();
+    
+//     // Find the specific token balance
+//     const tokenBalance = balances?.find((b: any) => b.asset_id === tokenId);
+    
+//     return parseFloat(tokenBalance?.amount || "0");
+//   } catch (error) {
+//     console.error("Error fetching token balance:", error);
+//     return this.currentPosition?.size || 0;
+//   }
+// }
+
+  getCurrentPosition() {
+    return this.currentPosition;
+  }
+
+  setCurrentTokenId(tokenId: string) {
+    this.currentTokenId = tokenId;
+  }
+
   async initialize(): Promise<void> {
     console.log("========================================");
     console.log("🚀 Starting ETH-Polymarket Arbitrage Bot");
     console.log("========================================\n");
-
     this.validateConfig();
 
     await this.updateMarketToken();
 
-    if (!this.currentTokenId) {
-      throw new Error("Failed to fetch initial token ID");
+    if (!this.currentYesTokenId || !this.currentNoTokenId) {
+      throw new Error("Failed to fetch initial token IDs");
     }
 
     this.polymarketClient = new PolymarketClient(
       this.config.polymarketPrivateKey,
       this.config.polymarketFunder,
       this.config.signatureType,
-      this.currentTokenId,
-      this
+      this.currentYesTokenId,//TODO: why is this here
+      this,
+      this.signalDetector
     );
 
     await this.polymarketClient.waitForInitialization();
 
     console.log(
-      `\n✅ Bot initialized with token: ${this.currentTokenId.slice(0, 20)}...\n`,
+      `\n✅ Bot initialized with YES token: ${this.currentYesTokenId.slice(0, 20)}...\n`,
     );
   }
 
@@ -420,7 +555,7 @@ class TradingBot {
     }
   }
 
-  async updateMarketToken(): Promise<void> {
+  async updateMarketToken(skipMarket?: boolean, direction?: string): Promise<void> {
     const afterNoon = Time.isPastNoon();
     const slug = Time.getNextMarketSlug(afterNoon);
 
@@ -433,25 +568,43 @@ class TradingBot {
       const ethPrice = await Market.getCurrentETHPrice();
       const btcPrice = await Market.getCurrentBTCPrice();
 
-      console.log(`💰 Current ETH Price: $${ethPrice.toFixed(2)}`);
+      console.log(`💰 Current BTC Price: $${btcPrice.toFixed(2)}`);
       console.log(`📊 Available thresholds: ${Object.keys(tokens).join(", ")}`);
 
       const availableThresholds = Object.keys(tokens);
-      //TODO: make changes atomic
-      const targetRange = Market.getClosestPriceRange(btcPrice, availableThresholds, "BTC");
+      let targetRange;
+
+      if (skipMarket) {
+        //TODO: check if makes sense in the future
+        targetRange = Market.getClosestPriceRange(btcPrice + (direction == "UP" ? 2000 : -2000), availableThresholds, "BTC");
+      } else {
+        targetRange = Market.getClosestPriceRange(btcPrice, availableThresholds, "BTC");
+      }
 
       if (targetRange && tokens[targetRange]) {
-        const newTokenId = tokens[targetRange];
+        const tokenPair = tokens[targetRange];
+        const yesTokenId = tokenPair.yes;
+        const noTokenId = tokenPair.no;
 
-        const orderbookExists = await Market.verifyOrderbook(newTokenId);
+        const orderbookExists = await Market.verifyOrderbook(yesTokenId);
 
         if (orderbookExists) {
-          this.currentTokenId = newTokenId;
+          this.currentYesTokenId = yesTokenId;
+          this.currentNoTokenId = noTokenId;
           console.log(`✅ Selected $${targetRange} threshold`);
-          console.log(`   Token ID: ${this.currentTokenId.slice(0, 20)}...`);
+          console.log(`   YES Token ID: ${this.currentYesTokenId.slice(0, 20)}...`);
+          console.log(`   NO Token ID: ${this.currentNoTokenId.slice(0, 20)}...`);
 
           if (this.polymarketClient) {
-            this.polymarketClient.updateTokenId(this.currentTokenId);
+            //yes/no doesn't matter at first
+            console.log("DIRECTION BEFORE UPDATING: ", direction);
+            if (direction == "UP") {
+              this.polymarketClient.updateTokenId(this.currentYesTokenId);
+            } else if (direction === "DOWN") {
+              this.polymarketClient.updateTokenId(this.currentNoTokenId);
+            } else {
+              this.polymarketClient.updateTokenId(this.currentYesTokenId);
+            }
           }
         } else {
           console.warn(
@@ -471,7 +624,7 @@ class TradingBot {
     console.log(`========================================\n`);
   }
 
-  private async findAlternativeToken(tokens: MarketTokens, price: number, excludeThresholds: string[],): Promise<void> {
+  private async findAlternativeToken(tokens: MarketTokens, price: number, excludeThresholds: string[]): Promise<void> {
     console.log(`🔍 Searching for alternative token...`);
 
     const sortedThresholds = Object.keys(tokens)
@@ -483,17 +636,19 @@ class TradingBot {
       .sort((a, b) => a.distance - b.distance);
 
     for (const { threshold } of sortedThresholds) {
-      const tokenId = tokens[threshold];
-      const orderbookExists = await Market.verifyOrderbook(tokenId);
+      const tokenPair = tokens[threshold];
+      const orderbookExists = await Market.verifyOrderbook(tokenPair.yes);
 
       if (orderbookExists) {
-        //TODO: USE tokenId
-        this.currentTokenId = "32803028585408577868406458580018477946412590313011129483341370530019960345035"; //tokenId;
+        this.currentYesTokenId = tokenPair.yes;
+        this.currentNoTokenId = tokenPair.no;
         console.log(`✅ Alternative found: $${threshold} threshold`);
-        console.log(`   Token ID: ${this.currentTokenId.slice(0, 20)}...`);
+        console.log(`   YES Token ID: ${this.currentYesTokenId.slice(0, 20)}...`);
+        console.log(`   NO Token ID: ${this.currentNoTokenId.slice(0, 20)}...`);
 
         if (this.polymarketClient) {
-          this.polymarketClient.updateTokenId(this.currentTokenId);
+          //this doesn't matter either, TODO: could probably remove both of these updateTokenIds
+          this.polymarketClient.updateTokenId(this.currentYesTokenId);
         }
         return;
       }
@@ -513,7 +668,7 @@ class TradingBot {
       async () => {
         //TODO add if else clause (if order open dont sell)
         console.log(`\n🔄 Periodic market check...`);
-        await this.updateMarketToken();
+        //await this.updateMarketToken();
       },
       60 * 60 * 1000,
     );
@@ -527,7 +682,7 @@ class TradingBot {
 
     if (this.lastSignalTime) {
       const timeSinceLastSignal = Date.now() - this.lastSignalTime.getTime();
-      if (timeSinceLastSignal < 30000) { // 30 seconds cooldown
+      if (timeSinceLastSignal < 30000) { 
         return;
       }
     }
@@ -540,23 +695,32 @@ class TradingBot {
   }
 
   private async handleSignal(signal: Signal): Promise<void> {
+    if (this.isProcessingSignal) {
+      console.log("⚙️ Still processing previous signal, skipping...");
+      return;
+    }
     this.isProcessingSignal = true;
     this.lastSignalTime = new Date();
 
+    //TODO: make it more understandable for down prices
     console.log(
       `📊 Signal detected: ${signal.direction} ${signal.percentChange.toFixed(2)}% move (${signal.previousPrice.toFixed(2)} -> ${signal.currentPrice.toFixed(2)})`,
     );
 
     const side: "BUY" | "SELL" = signal.direction === "UP" ? "BUY" : "SELL";
+    const tokenId = signal.direction === "UP" ? this.currentYesTokenId : this.currentNoTokenId;
+    this.currentTokenId = tokenId;
 
     try {
-      const orderResp = await this.polymarketClient!.placeMarketOrder(side, this.config.orderSize,);
+      this.polymarketClient!.updateTokenId(tokenId);
+      //this.currentPosition.size += 100.0;
+      const orderResp = await this.polymarketClient!.placeMarketOrder("BUY", this.config.orderSize);
 
-      this.PolymarketBuyAsk = await Market.getPolymarketBuyAsk(this.currentTokenId);
+      this.PolymarketBuyAsk = await Market.getPolymarketBuyAsk(tokenId);
 
       if (orderResp.success && orderResp.orderID) {
         console.log(
-          `✅ Order placed: ${side} ${this.config.orderSize} shares`,
+          `✅ Order placed: ${side} ${this.config.orderSize} shares at $${this.PolymarketBuyAsk?.toFixed(4)}`,
         );
 
         this.currentPosition = {
@@ -581,7 +745,7 @@ class TradingBot {
     }
   }
 
-  private async exitPosition(): Promise<void> {
+  async exitPosition(): Promise<void> {
     if (!this.currentPosition) {
       console.log("⚠️  No position to exit");
       this.isProcessingSignal = false;
@@ -595,25 +759,61 @@ class TradingBot {
       return;
     }
 
-    const exitSide: "BUY" | "SELL" =
-      this.currentPosition.side === "BUY" ? "SELL" : "BUY";
+    //const currentTokenId = this.currentPosition.side === "BUY" ? this.currentYesTokenId : this.currentNoTokenId;
+    //const currentTokenId = this.polymarketClient.tokenId;
+    this.PolymarketSellBid = await Market.getPolymarketSellBid(this.currentTokenId);
 
     try {
 
-      this.PolymarketSellBid = await Market.getPolymarketSellBid(this.currentTokenId);
+      if (!this.PolymarketBuyAsk || !this.PolymarketSellBid) {
+        console.warn("⚠️  Missing price data, retrying...");
+        setTimeout(() => this.exitPosition(), 5000);
+        return;
+      }
 
-      const { profit, profitPercent } = Market.calculateProfit(this.PolymarketBuyAsk!, this.PolymarketSellBid!, this.config.orderSize);
+      const { profit, profitPercent } = Market.calculateProfit(this.PolymarketBuyAsk, this.PolymarketSellBid, this.config.orderSize);
 
+      //this.polymarketClient.updateTokenId(this.currentPosition.tokenId);
       let exitResponse;
 
-      console.log("💰 Profit: ", profit);
+      console.log(`💰 Profit: $${profit.toFixed(4)} (${profitPercent.toFixed(2)}%)`);
+      console.log(`   Entry (ask): $${this.PolymarketBuyAsk.toFixed(4)}`);
+      console.log(`   Exit (bid): $${this.PolymarketSellBid.toFixed(4)}`);
 
-      if (profit > 0) {
-        exitResponse = await this.polymarketClient.placeMarketOrder(exitSide, this.currentPosition.size,);
+      const PROFIT_PERCENT = 1; //5% profit target
+      //TODO: added check to see if buy and sell are big.
+      const STOPLOSS_PERCENT = (this.PolymarketBuyAsk > this.config.tokenPriceRiskThreshold && this.PolymarketSellBid > this.config.tokenPriceRiskThreshold) ? -10 : -25; //Stop loss at -5%
+
+      console.log("TAKING AMOUNT: ", this.polymarketClient.takingAmount);
+      if (profitPercent >= PROFIT_PERCENT) {
+        //TODO: get all shares
+        exitResponse = await this.polymarketClient.placeMarketOrder("SELL", Number(this.polymarketClient.takingAmount));
+        //this.currentPosition
+        //exitResponse.makingAmount == what i'm SELLING
+        const difference = Number(this.polymarketClient.takingAmount) - exitResponse.makingAmount;
+        if ((difference * this.PolymarketSellBid) > 0.5) {
+          this.polymarketClient.takingAmount = difference.toString();
+          setTimeout(() => {
+            console.log(`⚠️ ${difference.toFixed(4)} shares unfilled, retrying in 2.5s...`);
+            this.exitPosition();
+          }, 2500);
+          return; 
+        }
         this.PolymarketSellBid = null;
         this.PolymarketBuyAsk = null;
-        console.log(`Position closed: ${this.currentPosition.side} -> ${exitSide}`,);
-        console.log(`Exit order ID: ${exitResponse.orderID}`);
+        console.log(`✅ Position closed: ${this.currentPosition.side}`);
+        console.log(`   Exit order ID: ${exitResponse.orderID}`);
+
+        this.currentPosition = null;
+        this.isProcessingSignal = false;
+      }  else if (profitPercent <= STOPLOSS_PERCENT) {
+        console.log(`⛔ Stop loss triggered: ${profitPercent.toFixed(2)}% ($${profit.toFixed(4)})`);
+        //this.currentPosition.size += 100.0;
+        exitResponse = await this.polymarketClient.placeMarketOrder("SELL", Number(this.polymarketClient.takingAmount));
+        this.PolymarketSellBid = null;
+        this.PolymarketBuyAsk = null;
+        console.log(`✅ Position closed: ${this.currentPosition.side}`);
+        console.log(`   Exit order ID: ${exitResponse.orderID}`);
 
         this.currentPosition = null;
         this.isProcessingSignal = false;
@@ -624,8 +824,11 @@ class TradingBot {
       }
     } catch (error) {
       console.error(`❌ Error exiting position:`, error);
-      this.currentPosition = null;
-      this.isProcessingSignal = false; 
+      if (this.currentPosition) {
+        setTimeout(() => this.exitPosition(), 5000);
+      }
+      //this.currentPosition = null;
+      //this.isProcessingSignal = false; 
     }
   }
 
@@ -665,4 +868,3 @@ main().catch((error) => {
   console.error("💥 Fatal error:", error);
   process.exit(1);
 });
-//
