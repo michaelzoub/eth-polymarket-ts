@@ -37,3 +37,6 @@ Order Size: $5 per trade
 Profit Target: 1%
 Stop Loss: -10% to -25% (depending on token price)
 Exit Window: 25 seconds
+
+## Learning experience
+https://x.com/wenkafka/status/1988280388997751193
